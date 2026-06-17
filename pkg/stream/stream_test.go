@@ -177,6 +177,43 @@ func TestStreamBeginRefused(t *testing.T) {
 	}
 }
 
+// TestStreamBeginContextCanceledSendsEnd verifies that cancelling the context
+// after BEGIN was sent (but before CONNECTED arrives) tears the half-open stream
+// down with a RELAY_END and drops it from the manager, instead of leaking it.
+func TestStreamBeginContextCanceledSendsEnd(t *testing.T) {
+	t.Parallel()
+	mc := &mockCarrier{} // no autoConnect: BEGIN never completes
+	m := NewManager(mc, nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		for {
+			if mc.relayCount(cell.RelayBegin) > 0 {
+				cancel()
+				return
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	s, err := m.Begin(ctx, "example.com:80")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("Begin err = %v, want context.Canceled", err)
+	}
+	if s != nil {
+		t.Fatal("Begin returned a stream despite cancellation")
+	}
+	if got := mc.relayCount(cell.RelayEnd); got != 1 {
+		t.Fatalf("RELAY_END after cancellation = %d, want 1", got)
+	}
+	m.mu.Lock()
+	n := len(m.streams)
+	m.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("manager still tracks %d streams after cancellation, want 0", n)
+	}
+}
+
 func TestStreamConsumptionSendme(t *testing.T) {
 	t.Parallel()
 	mc := &mockCarrier{autoConnect: true}

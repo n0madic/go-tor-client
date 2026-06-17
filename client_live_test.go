@@ -201,6 +201,22 @@ func getThroughTor(t *testing.T, client *Client, url string) string {
 	return strings.TrimSpace(string(body))
 }
 
+// waitForClearnetCircuits polls the pool until it holds want clearnet circuits or
+// timeout elapses, returning whether the target was reached. It absorbs the brief
+// async gap between an HTTP body close and the stream slot being released.
+func waitForClearnetCircuits(client *Client, want int, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if client.Stats().ClearnetCircuits == want {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return client.Stats().ClearnetCircuits == want
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 // TestCircuitReuseLive makes two sequential clearnet requests to the same port
 // and asserts the second reuses the first's pooled circuit rather than building
 // a new one.
@@ -262,8 +278,11 @@ func TestNewIdentityLive(t *testing.T) {
 	builtBefore := client.Stats().Built
 
 	client.NewIdentity()
-	if got := client.Stats().ClearnetCircuits; got != 0 {
-		t.Fatalf("ClearnetCircuits = %d after NewIdentity, want 0", got)
+	// NewIdentity retires the in-use circuit but only tears it down once its last
+	// stream closes. The HTTP transport releases that stream asynchronously after
+	// the response body is closed, so poll briefly rather than racing it.
+	if !waitForClearnetCircuits(client, 0, 5*time.Second) {
+		t.Fatalf("ClearnetCircuits = %d after NewIdentity, want 0", client.Stats().ClearnetCircuits)
 	}
 
 	if ip := getThroughTor(t, client, "http://api.ipify.org/"); net.ParseIP(ip) == nil {

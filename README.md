@@ -218,7 +218,10 @@ Key cryptography is pinned to official test vectors: the hs_ntor handshake
   consensus-refresh requests are sent through Tor over a `BEGIN_DIR` circuit, so
   they are not made directly from your IP to the authorities. (The very first
   cold-start consensus is necessarily fetched directly — there is no circuit
-  yet.)
+  yet.) If the tunnel fails, the fetch **fails closed** by default rather than
+  silently retrying over direct HTTP from your IP; set
+  `Config.AllowDirectDirFallback` to opt in to the direct fallback (it is logged
+  at `WARN` when it happens).
 - **Consumption-based stream flow control** — stream SENDMEs are emitted as the
   application *reads* data, so a slow reader back-pressures the sender and
   buffering stays bounded by the window rather than growing unboundedly.

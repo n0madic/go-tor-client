@@ -54,16 +54,6 @@ func SHAKE256(outLen int, parts ...[]byte) []byte {
 	return out
 }
 
-// newSHAKE256 returns a SHAKE256 sponge seeded with parts, ready for streaming
-// reads (used as an AES-CTR-like keystream in the descriptor layer).
-func newSHAKE256(parts ...[]byte) *sha3.SHAKE {
-	s := sha3.NewSHAKE256()
-	for _, p := range parts {
-		s.Write(p)
-	}
-	return s
-}
-
 // sha3New256 is the hash constructor for SHA3-256, used by RunningDigest for
 // hidden-service end-to-end circuits.
 func sha3New256() hash.Hash { return sha3.New256() }

@@ -58,15 +58,6 @@ func NtorClientHandshake(nodeID, ntorOnionKey []byte) (clientData []byte, state 
 	return finishClientHandshake(nodeID, ntorOnionKey, eph)
 }
 
-// ntorClientHandshakeWithEph is the deterministic variant used by tests.
-func ntorClientHandshakeWithEph(nodeID, ntorOnionKey, ephSeed []byte) ([]byte, *NtorClient, error) {
-	eph, err := newX25519FromSeed(ephSeed)
-	if err != nil {
-		return nil, nil, err
-	}
-	return finishClientHandshake(nodeID, ntorOnionKey, eph)
-}
-
 func finishClientHandshake(nodeID, ntorOnionKey []byte, eph *X25519KeyPair) ([]byte, *NtorClient, error) {
 	if len(nodeID) != NodeIDLen {
 		return nil, nil, fmt.Errorf("ntor: nodeID must be %d bytes, got %d", NodeIDLen, len(nodeID))

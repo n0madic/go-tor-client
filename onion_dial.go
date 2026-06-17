@@ -11,7 +11,6 @@ import (
 	"net"
 	"net/http"
 	"strconv"
-	"sync"
 	"time"
 
 	"github.com/n0madic/go-tor-client/pkg/cell"
@@ -199,7 +198,8 @@ func (c *Client) fetchDescriptor(ctx context.Context, dirs []onion.RingNode, bli
 			lastErr = err
 			continue
 		}
-		raw, err := c.dirGet(attemptCtx, circ, path)
+		// Dedicated single-use circuit, so a fresh manager per attempt is fine.
+		raw, err := c.dirGet(attemptCtx, stream.NewManager(circ, c.log), path)
 		circ.Destroy()
 		cancel()
 		if err != nil {
@@ -207,7 +207,7 @@ func (c *Client) fetchDescriptor(ctx context.Context, dirs []onion.RingNode, bli
 			lastErr = err
 			continue
 		}
-		desc, err := onion.DecodeDescriptor(raw, blinded, subcred, clientAuthKey)
+		desc, err := onion.DecodeDescriptor(raw, blinded, subcred, clientAuthKey, time.Now())
 		if err != nil {
 			c.log.Debug("onion: descriptor decode failed", "hsdir", info.Nickname, "bytes", len(raw), "err", err)
 			lastErr = err
@@ -222,9 +222,10 @@ func (c *Client) fetchDescriptor(ctx context.Context, dirs []onion.RingNode, bli
 	return nil, fmt.Errorf("tor: fetch onion descriptor: %w", lastErr)
 }
 
-// dirGet opens a BEGIN_DIR stream on circ and performs an HTTP/1.0 GET.
-func (c *Client) dirGet(ctx context.Context, circ *circuit.Circuit, path string) ([]byte, error) {
-	mgr := stream.NewManager(circ, c.log)
+// dirGet opens a BEGIN_DIR stream via mgr and performs an HTTP/1.0 GET. The
+// caller owns the manager's lifetime: the shared directory circuit reuses one
+// persistent manager, while per-HSDir descriptor fetches pass a single-use one.
+func (c *Client) dirGet(ctx context.Context, mgr *stream.Manager, path string) ([]byte, error) {
 	s, err := mgr.BeginDir(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("BEGIN_DIR: %w", err)
@@ -297,7 +298,6 @@ type onionControl struct {
 	established chan struct{}
 	rendezvous2 chan []byte
 	introAck    chan uint16
-	once        sync.Once
 }
 
 func newOnionControl() *onionControl {

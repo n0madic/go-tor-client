@@ -14,6 +14,7 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/n0madic/go-tor-client/pkg/torcrypto"
 )
@@ -48,10 +49,11 @@ type Descriptor struct {
 // points. blindedKey is A' for the period; subcred is the subcredential.
 // clientAuthKey is an optional 32-byte x25519 private key for services with
 // restricted discovery (client authorization); pass nil for public services.
-func DecodeDescriptor(raw []byte, blindedKey, subcred, clientAuthKey []byte) (*Descriptor, error) {
+// now is the reference time used to reject an expired descriptor-signing cert.
+func DecodeDescriptor(raw []byte, blindedKey, subcred, clientAuthKey []byte, now time.Time) (*Descriptor, error) {
 	// Authenticate the descriptor against the period's blinded key before
 	// trusting any of its contents (defends against a malicious HSDir).
-	if err := VerifyDescriptorSignature(raw, blindedKey); err != nil {
+	if err := VerifyDescriptorSignature(raw, blindedKey, now); err != nil {
 		return nil, err
 	}
 	revCounter, superBlob, err := parseOuter(raw)
@@ -221,6 +223,11 @@ func parseIntroPoints(inner []byte) ([]IntroPoint, error) {
 			if cur != nil {
 				cert, next := readCertBlock(lines, i+1)
 				if cert != nil {
+					// TODO: also verify this cert's own signature against the
+					// descriptor signing key. The intro point's integrity is
+					// already covered transitively (this whole inner layer is
+					// decrypted from the descriptor authenticated in
+					// VerifyDescriptorSignature), so we only extract the key here.
 					cur.AuthKey = certifiedKey(cert)
 				}
 				i = next - 1 // resume after the block (loop's i++ steps to next)

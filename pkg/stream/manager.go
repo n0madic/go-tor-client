@@ -90,6 +90,10 @@ func (m *Manager) begin(ctx context.Context, command cell.RelayCommand, body []b
 		}
 		return s, nil
 	case <-ctx.Done():
+		// BEGIN was already sent; tell the relay to discard the now-orphaned
+		// half-open stream with a RELAY_END instead of leaving it to time out
+		// (and stop a late CONNECTED/DATA arriving as "unknown stream" traffic).
+		_ = m.circ.SendRelay(cell.RelayCell{Command: cell.RelayEnd, StreamID: s.id, Data: []byte{endReasonDone}})
 		m.remove(s.id)
 		return nil, ctx.Err()
 	}

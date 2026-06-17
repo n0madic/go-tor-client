@@ -33,12 +33,13 @@ const (
 // Client fetches directory documents over plain HTTP from directory
 // authorities (used for cold-start bootstrap).
 type Client struct {
-	authorities []Authority
-	http        *http.Client
-	log         *slog.Logger
-	now         func() time.Time
-	cache       Cache
-	tunnel      Tunnel
+	authorities         []Authority
+	http                *http.Client
+	log                 *slog.Logger
+	now                 func() time.Time
+	cache               Cache
+	tunnel              Tunnel
+	allowDirectFallback bool
 }
 
 // Tunnel fetches a directory document over Tor via a BEGIN_DIR stream, used to
@@ -53,9 +54,18 @@ type Tunnel interface {
 // disable caching.
 func (c *Client) UseCache(cache Cache) { c.cache = cache }
 
-// UseTunnel routes subsequent directory fetches through Tor (BEGIN_DIR),
-// falling back to direct HTTP if the tunnel fails. Pass nil to disable.
+// UseTunnel routes subsequent directory fetches through Tor (BEGIN_DIR). Pass
+// nil to disable. Once a tunnel is set, a tunnel failure is returned as an error
+// (fail-closed) by default rather than silently retried over direct HTTP, which
+// would leak the request from the local IP; see AllowDirectFallback to opt in to
+// the fallback.
 func (c *Client) UseTunnel(t Tunnel) { c.tunnel = t }
+
+// AllowDirectFallback controls whether a failed tunnel fetch may fall back to
+// direct HTTP to the authorities (leaking the request from the local IP).
+// Default false: tunnel failures are returned as errors so a transient tunnel
+// problem cannot silently deanonymize post-bootstrap directory traffic.
+func (c *Client) AllowDirectFallback(allow bool) { c.allowDirectFallback = allow }
 
 func (c *Client) cacheGet(key string) ([]byte, bool) {
 	if c.cache == nil {
@@ -273,16 +283,23 @@ func (c *Client) fetchMicrodescriptors(ctx context.Context, hashes []string, fet
 	return out, nil
 }
 
-// fetchFromAny fetches a directory path, preferring the Tor tunnel (if set)
-// and falling back to direct HTTP to the authorities.
+// fetchFromAny fetches a directory path. With no tunnel set (cold-start
+// bootstrap, before any circuit exists) it goes direct. Once a tunnel is set it
+// fetches over Tor and, on failure, fails closed by default — returning the error
+// rather than silently leaking the request from the local IP — unless direct
+// fallback has been explicitly enabled via AllowDirectFallback.
 func (c *Client) fetchFromAny(ctx context.Context, path string) ([]byte, error) {
-	if c.tunnel != nil {
-		if body, err := c.tunnel.DirGet(ctx, path); err == nil {
-			return body, nil
-		} else {
-			c.log.Debug("tunneled dir fetch failed; using direct", "err", err)
-		}
+	if c.tunnel == nil {
+		return c.fetchDirect(ctx, path)
 	}
+	body, err := c.tunnel.DirGet(ctx, path)
+	if err == nil {
+		return body, nil
+	}
+	if !c.allowDirectFallback {
+		return nil, fmt.Errorf("directory: tunnel fetch failed and direct fallback is disabled: %w", err)
+	}
+	c.log.Warn("tunneled dir fetch failed; falling back to direct HTTP (leaks request from local IP)", "err", err)
 	return c.fetchDirect(ctx, path)
 }
 

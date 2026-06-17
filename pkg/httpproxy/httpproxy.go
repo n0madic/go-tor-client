@@ -58,17 +58,20 @@ func (s *Server) logger() *slog.Logger {
 }
 
 // transportFor returns the forwarding transport for the given identity, building
-// it (over a freshly resolved per-identity Dialer) on first use. The lock is
-// held across the Factory call, so first use of a new identity briefly
-// serializes other transport lookups; this is acceptable as identities are few
-// and Factory typically caches the heavy per-identity state itself.
+// it (over a freshly resolved per-identity Dialer) on first use. The Factory call
+// runs WITHOUT the lock held, so first use of a new identity — which may bootstrap
+// a fresh upstream client — does not serialize transport lookups for other
+// identities. Factory deduplicates concurrent bootstraps of the same identity, so
+// at worst two cheap transports are built and the loser is discarded.
 func (s *Server) transportFor(ctx context.Context, user, pass string) (*http.Transport, error) {
 	key := proxyauth.IsoKey(user, pass)
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if t, ok := s.transports[key]; ok {
+		s.mu.Unlock()
 		return t, nil
 	}
+	s.mu.Unlock()
+
 	dialer, err := s.Factory(ctx, user, pass)
 	if err != nil {
 		return nil, err
@@ -79,6 +82,12 @@ func (s *Server) transportFor(ctx context.Context, user, pass string) (*http.Tra
 		TLSHandshakeTimeout:   30 * time.Second,
 		ResponseHeaderTimeout: 60 * time.Second,
 		DisableKeepAlives:     true,
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if existing, ok := s.transports[key]; ok {
+		return existing, nil // lost the race; reuse the winner
 	}
 	if s.transports == nil {
 		s.transports = make(map[string]*http.Transport)

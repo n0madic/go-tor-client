@@ -4,24 +4,36 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"encoding/base64"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 )
 
 // descSigPrefix prefixes the signed portion of a v3 descriptor (rend-spec-v3).
 const descSigPrefix = "Tor onion service descriptor sig v3"
 
+// descriptor-signing-key-cert fields (cert-spec.txt / rend-spec-v3 [DESC-OUTER]):
+// an ed25519 cert (version 1), type [08] (cross-certified by the period's
+// blinded key), certifying an ed25519 key (key type [01]).
+const (
+	descCertVersion  = 0x01
+	descCertType     = 0x08
+	descCertKeyType  = 0x01
+	certExtSignerKey = 0x04 // signed-with-ed25519-key extension
+)
+
 // VerifyDescriptorSignature checks the outer descriptor's authenticity: the
 // descriptor-signing-key-cert must be signed by the period's blinded key, and
 // the descriptor signature must verify under the certified signing key. This
 // prevents a malicious HSDir from substituting a forged descriptor.
-func VerifyDescriptorSignature(raw, blindedKey []byte) error {
+func VerifyDescriptorSignature(raw, blindedKey []byte, now time.Time) error {
 	certDER := extractCert(raw, "descriptor-signing-key-cert")
 	if certDER == nil {
 		return errors.New("onion: descriptor missing signing-key cert")
 	}
-	signingKey, err := verifyDescCert(certDER, blindedKey)
+	signingKey, err := verifyDescCert(certDER, blindedKey, now)
 	if err != nil {
 		return err
 	}
@@ -51,13 +63,28 @@ func VerifyDescriptorSignature(raw, blindedKey []byte) error {
 	return nil
 }
 
-// verifyDescCert parses a Tor ed25519 cert, checks it is signed by blindedKey
-// (carried in the signed-with-ed25519-key extension and matching the expected
-// blinded key), and returns the certified signing key.
-func verifyDescCert(cert, blindedKey []byte) ([]byte, error) {
+// verifyDescCert parses a Tor ed25519 cert, enforces its version/type/key-type
+// and expiration, checks it is signed by blindedKey (carried in the
+// signed-with-ed25519-key extension and matching the expected blinded key), and
+// returns the certified signing key.
+func verifyDescCert(cert, blindedKey []byte, now time.Time) ([]byte, error) {
 	// VER(1)|TYPE(1)|EXP(4)|KEYTYPE(1)|CERTIFIED_KEY(32)|N_EXT(1)|exts|SIG(64)
 	if len(cert) < 1+1+4+1+32+1+64 {
 		return nil, errors.New("onion: short descriptor cert")
+	}
+	if cert[0] != descCertVersion {
+		return nil, fmt.Errorf("onion: descriptor cert version %d, want %d", cert[0], descCertVersion)
+	}
+	if cert[1] != descCertType {
+		return nil, fmt.Errorf("onion: descriptor cert type 0x%02x, want 0x%02x", cert[1], descCertType)
+	}
+	if cert[6] != descCertKeyType {
+		return nil, fmt.Errorf("onion: descriptor cert key type 0x%02x, want 0x%02x", cert[6], descCertKeyType)
+	}
+	// EXP is hours since the Unix epoch (cert-spec.txt); reject a stale cert.
+	expiry := time.Unix(int64(binary.BigEndian.Uint32(cert[2:6]))*3600, 0)
+	if now.After(expiry) {
+		return nil, fmt.Errorf("onion: descriptor cert expired at %s", expiry.UTC().Format(time.RFC3339))
 	}
 	signingKey := append([]byte(nil), cert[7:39]...)
 	nExt := int(cert[39])
@@ -73,7 +100,7 @@ func verifyDescCert(cert, blindedKey []byte) ([]byte, error) {
 		if pos+extLen > len(cert) {
 			return nil, errors.New("onion: cert extension overflow")
 		}
-		if extType == 0x04 && extLen == 32 {
+		if extType == certExtSignerKey && extLen == 32 {
 			signer = append([]byte(nil), cert[pos:pos+32]...)
 		}
 		pos += extLen

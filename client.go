@@ -50,6 +50,12 @@ type Config struct {
 	// after first use, mirroring tor's option of the same name. Zero selects the
 	// 10-minute default.
 	MaxCircuitDirtiness time.Duration
+	// AllowDirectDirFallback permits post-bootstrap directory fetches to fall back
+	// to direct HTTP (from the local IP) when the Tor tunnel fails. Default false:
+	// once the tunnel is up, tunnel failures are returned as errors rather than
+	// silently deanonymizing the request. The cold-start consensus is always
+	// fetched directly regardless of this setting.
+	AllowDirectDirFallback bool
 }
 
 // Client is a bootstrapped Tor client.
@@ -66,6 +72,7 @@ type Client struct {
 	mdCache   map[string]directory.Microdescriptor
 	ringCache []onion.RingNode
 	dirCirc   *circuit.Circuit // reusable circuit for tunneled directory fetches
+	dirMgr    *stream.Manager  // persistent stream manager bound to dirCirc (one per circuit)
 	onionAuth map[string][]byte
 	closed    bool
 
@@ -124,6 +131,7 @@ func NewClient(ctx context.Context, cfg *Config) (*Client, error) {
 	}
 
 	dir := directory.NewClient(cfg.DirAuthorities, log)
+	dir.AllowDirectFallback(cfg.AllowDirectDirFallback)
 	if cache := resolveCache(cfg, log); cache != nil {
 		dir.UseCache(cache)
 	}
@@ -368,6 +376,7 @@ func (c *Client) NewIdentity() {
 	c.mu.Lock()
 	dirCirc := c.dirCirc
 	c.dirCirc = nil
+	c.dirMgr = nil
 	c.mu.Unlock()
 	if dirCirc != nil {
 		dirCirc.Destroy()
@@ -394,6 +403,7 @@ func (c *Client) RotateGuard(ctx context.Context) error {
 	// New guard is up; tear down everything bound to the old guard channel.
 	c.mu.Lock()
 	c.dirCirc = nil
+	c.dirMgr = nil
 	c.mu.Unlock()
 
 	c.poolMu.Lock()

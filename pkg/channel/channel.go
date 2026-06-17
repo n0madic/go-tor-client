@@ -299,18 +299,6 @@ func (ch *Channel) Close() error {
 	return ch.conn.Close()
 }
 
-func bytesEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
 func randUint32() uint32 {
 	var b [4]byte
 	if _, err := rand.Read(b[:]); err != nil {

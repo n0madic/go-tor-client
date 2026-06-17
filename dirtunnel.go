@@ -6,22 +6,29 @@ import (
 
 	"github.com/n0madic/go-tor-client/pkg/circuit"
 	"github.com/n0madic/go-tor-client/pkg/directory"
+	"github.com/n0madic/go-tor-client/pkg/stream"
 )
 
 // DirGet implements directory.Tunnel: it fetches a directory document through
 // Tor over a reusable BEGIN_DIR circuit, anonymizing post-bootstrap directory
-// requests (microdescriptors, consensus refreshes).
+// requests (microdescriptors, consensus refreshes). The circuit's stream
+// manager is shared and persistent, so concurrent DirGet calls multiplex
+// distinct streams over it instead of each resetting the circuit's cell handler.
 func (c *Client) DirGet(ctx context.Context, path string) ([]byte, error) {
-	circ, err := c.dirCircuit(ctx)
+	circ, mgr, err := c.dirCircuit(ctx)
 	if err != nil {
 		return nil, err
 	}
-	body, err := c.dirGet(ctx, circ, path)
-	if err != nil {
-		// The circuit may be dead; drop it so the next call rebuilds.
+	body, err := c.dirGet(ctx, mgr, path)
+	if err != nil && circ.Closed() {
+		// The shared circuit died; drop it so the next call rebuilds. A
+		// transient per-request error (e.g. context cancellation or an HSDir
+		// HTTP error) leaves the still-open circuit in place for concurrent and
+		// subsequent directory fetches instead of tearing it out from under them.
 		c.mu.Lock()
 		if c.dirCirc == circ {
 			c.dirCirc = nil
+			c.dirMgr = nil
 		}
 		c.mu.Unlock()
 		circ.Destroy()
@@ -29,37 +36,42 @@ func (c *Client) DirGet(ctx context.Context, path string) ([]byte, error) {
 	return body, err
 }
 
-// dirCircuit returns the shared directory circuit, building it if absent or dead.
-func (c *Client) dirCircuit(ctx context.Context) (*circuit.Circuit, error) {
+// dirCircuit returns the shared directory circuit and its persistent stream
+// manager, building both if absent or dead.
+func (c *Client) dirCircuit(ctx context.Context) (*circuit.Circuit, *stream.Manager, error) {
 	c.mu.Lock()
 	if c.dirCirc != nil && !c.dirCirc.Closed() {
-		circ := c.dirCirc
+		circ, mgr := c.dirCirc, c.dirMgr
 		c.mu.Unlock()
-		return circ, nil
+		return circ, mgr, nil
 	}
 	c.mu.Unlock()
 
 	circ, err := c.buildDirCircuit(ctx)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	// One manager per circuit, registered once: it installs the circuit's stream
+	// handler and multiplexes every tunneled directory stream over it.
+	mgr := stream.NewManager(circ, c.log)
 	c.mu.Lock()
 	if c.closed {
 		c.mu.Unlock()
 		circ.Destroy()
-		return nil, fmt.Errorf("tor: client closed")
+		return nil, nil, fmt.Errorf("tor: client closed")
 	}
 	if c.dirCirc != nil && !c.dirCirc.Closed() {
 		// Another goroutine built a directory circuit while we were building;
 		// keep theirs and tear ours down so it is not leaked.
-		existing := c.dirCirc
+		existing, existingMgr := c.dirCirc, c.dirMgr
 		c.mu.Unlock()
 		circ.Destroy()
-		return existing, nil
+		return existing, existingMgr, nil
 	}
 	c.dirCirc = circ
+	c.dirMgr = mgr
 	c.mu.Unlock()
-	return circ, nil
+	return circ, mgr, nil
 }
 
 // buildDirCircuit builds guard -> middle -> dir-cache(V2Dir). It resolves its
