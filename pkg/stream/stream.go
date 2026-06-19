@@ -2,6 +2,7 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -73,7 +74,6 @@ type Stream struct {
 	consumedCells int
 
 	connectCh chan error
-	connected bool
 
 	pkgTokens chan struct{} // stream-level package window permits
 
@@ -101,9 +101,6 @@ func newStream(m *Manager, id uint16) *Stream {
 func (s *Stream) handleCell(rc cell.RelayCell) {
 	switch rc.Command {
 	case cell.RelayConnected:
-		s.readMu.Lock()
-		s.connected = true
-		s.readMu.Unlock()
 		select {
 		case s.connectCh <- nil:
 		default:
@@ -283,6 +280,15 @@ func (s *Stream) Write(p []byte) (int, error) {
 		err := s.mgr.circ.SendData(ctx, s.id, chunk)
 		cancel()
 		if err != nil {
+			// The cell never reached the relay, so return the stream-level package
+			// token consumed above (the circuit-level token is reclaimed inside
+			// SendData), keeping the send window accurate for any retry.
+			s.creditPackage(1)
+			// A write-deadline expiry must surface as a net.Error timeout per the
+			// net.Conn contract; SendData returns the bare context error.
+			if errors.Is(err, context.DeadlineExceeded) {
+				return total, timeoutError{}
+			}
 			return total, fmt.Errorf("stream: write: %w", err)
 		}
 		total += len(chunk)

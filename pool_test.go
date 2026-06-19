@@ -231,3 +231,107 @@ func (l *fakeLink) closeAll() {
 		close(d)
 	}
 }
+
+// TestPoolGrowthBound verifies the pool retires (rather than retains) circuits
+// built once the clearnet pool or per-host onion pool is at capacity, bounding
+// the number of reusable circuits kept in memory. Retired circuits are excluded
+// from the reuse count.
+func TestPoolGrowthBound(t *testing.T) {
+	t.Parallel()
+	link := &fakeLink{}
+	t.Cleanup(link.closeAll)
+	c := newPoolTestClient()
+
+	// Clearnet: below cap retains; at cap retires.
+	c.poolMu.Lock()
+	belowCap := c.retireNewClearnetLocked()
+	c.poolMu.Unlock()
+	if belowCap {
+		t.Fatal("an empty pool should not retire a new clearnet circuit")
+	}
+	for range maxClearnetCircuits {
+		c.clearnetPool = append(c.clearnetPool, newPooledTest(t, link, "", 0))
+	}
+	// A retired circuit does not count toward the cap.
+	retired := newPooledTest(t, link, "", 0)
+	retired.retired = true
+	c.clearnetPool = append(c.clearnetPool, retired)
+	c.poolMu.Lock()
+	atCap := c.retireNewClearnetLocked()
+	reusable := c.reusableClearnetLocked()
+	c.poolMu.Unlock()
+	if reusable != maxClearnetCircuits {
+		t.Fatalf("reusableClearnetLocked = %d, want %d (retired excluded)", reusable, maxClearnetCircuits)
+	}
+	if !atCap {
+		t.Fatal("at capacity, a new clearnet circuit must be retired")
+	}
+
+	// Onion: per-host cap.
+	for range maxOnionCircuitsPerHost {
+		c.onionPool["h"] = append(c.onionPool["h"], newPooledTest(t, link, "h", 0))
+	}
+	c.poolMu.Lock()
+	hostAtCap := c.retireNewOnionLocked("h")
+	freshHost := c.retireNewOnionLocked("other")
+	c.poolMu.Unlock()
+	if !hostAtCap {
+		t.Fatal("at the per-host cap, a new onion circuit must be retired")
+	}
+	if freshHost {
+		t.Fatal("a fresh host under the host cap must not be retired")
+	}
+}
+
+// TestPoolConcurrentAccess hammers the pool's acquire/release/reap/Stats paths
+// from many goroutines so the race detector validates the poolMu locking. Run
+// with -race.
+func TestPoolConcurrentAccess(t *testing.T) {
+	t.Parallel()
+	link := &fakeLink{}
+	t.Cleanup(link.closeAll)
+	c := newPoolTestClient()
+
+	acceptAll := directory.Microdescriptor{ExitPolicy: directory.ExitPolicy{
+		IsAccept: true,
+		Ports:    []directory.PortRange{{Lo: 1, Hi: 65535}},
+	}}
+	for range 4 {
+		pc := newPooledTest(t, link, "", 0)
+		pc.exitMD = acceptAll
+		c.clearnetPool = append(c.clearnetPool, pc)
+	}
+
+	stop := make(chan struct{})
+	var janitor sync.WaitGroup
+	janitor.Add(1)
+	go func() {
+		defer janitor.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+				c.reap()
+				_ = c.Stats()
+			}
+		}
+	}()
+
+	var wg sync.WaitGroup
+	for range 8 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for range 300 {
+				if pc := c.acquireClearnet(443); pc != nil {
+					c.releaseStream(pc)
+				}
+				_ = c.Stats()
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	janitor.Wait()
+}

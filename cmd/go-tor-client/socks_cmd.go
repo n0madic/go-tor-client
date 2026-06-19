@@ -46,6 +46,7 @@ func runSocks(ctx context.Context, args []string) error {
 	}
 	defer ln.Close()
 	logger.Info("SOCKS5 proxy listening", "addr", ln.Addr())
+	warnIfPublicListener(logger, ln.Addr())
 
 	srv := &socks.Server{Factory: pool.dialer, Logger: logger}
 	return srv.Serve(ctx, ln)

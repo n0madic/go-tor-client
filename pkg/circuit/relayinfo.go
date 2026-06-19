@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strconv"
 
 	"github.com/n0madic/go-tor-client/internal/byteutil"
 )
@@ -42,10 +43,13 @@ func (r RelayInfo) linkSpecifiers() ([]byte, error) {
 	if ip == nil {
 		return nil, fmt.Errorf("relayinfo: ORAddr host %q is not an IP", host)
 	}
-	var port uint16
-	if _, err := fmt.Sscanf(portStr, "%d", &port); err != nil {
+	// Strict parse: ParseUint rejects trailing garbage and out-of-range values,
+	// unlike fmt.Sscanf which would accept e.g. "443x".
+	port64, err := strconv.ParseUint(portStr, 10, 16)
+	if err != nil {
 		return nil, fmt.Errorf("relayinfo: bad port %q: %w", portStr, err)
 	}
+	port := uint16(port64)
 	if len(r.RSAIDDigest) != 20 {
 		return nil, errors.New("relayinfo: RSAIDDigest must be 20 bytes")
 	}

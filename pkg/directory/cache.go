@@ -28,12 +28,16 @@ func NewDiskCache(dir string) (*DiskCache, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	return &DiskCache{dir: dir}, nil
+	return &DiskCache{dir: filepath.Clean(dir)}, nil
 }
 
 // Get returns the cached bytes for key, or (nil, false) if absent.
 func (d *DiskCache) Get(key string) ([]byte, bool) {
-	b, err := os.ReadFile(d.path(key))
+	p, ok := d.path(key)
+	if !ok {
+		return nil, false
+	}
+	b, err := os.ReadFile(p)
 	if err != nil {
 		return nil, false
 	}
@@ -44,7 +48,10 @@ func (d *DiskCache) Get(key string) ([]byte, bool) {
 func (d *DiskCache) Put(key string, data []byte) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	p := d.path(key)
+	p, ok := d.path(key)
+	if !ok {
+		return
+	}
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return
 	}
@@ -55,16 +62,31 @@ func (d *DiskCache) Put(key string, data []byte) {
 	_ = os.Rename(tmp, p)
 }
 
-func (d *DiskCache) path(key string) string {
+// path maps a key to its on-disk file, returning ok=false if the result would
+// escape the cache root (defense in depth against a crafted key).
+func (d *DiskCache) path(key string) (string, bool) {
 	prefix, rest, ok := strings.Cut(key, "/")
+	var p string
 	if !ok {
-		return filepath.Join(d.dir, sanitizeKey(key))
+		p = filepath.Join(d.dir, sanitizeKey(key))
+	} else {
+		p = filepath.Join(d.dir, sanitizeKey(prefix), sanitizeKey(rest))
 	}
-	return filepath.Join(d.dir, sanitizeKey(prefix), sanitizeKey(rest))
+	// Confirm the cleaned path stays within d.dir, never above or outside it.
+	if p != d.dir && !strings.HasPrefix(p, d.dir+string(filepath.Separator)) {
+		return "", false
+	}
+	return p, true
 }
 
 // sanitizeKey maps a key segment to a filesystem-safe name (microdescriptor
-// hashes are base64 and may contain '/' and '+').
+// hashes are base64 and may contain '/' and '+'). Path separators and parent
+// references are neutralized so a segment can never traverse directories.
 func sanitizeKey(s string) string {
-	return strings.NewReplacer("/", "_", "+", "-", "..", "__").Replace(s)
+	return strings.NewReplacer(
+		"/", "_",
+		`\`, "_",
+		"+", "-",
+		"..", "__",
+	).Replace(s)
 }

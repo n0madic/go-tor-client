@@ -81,6 +81,37 @@ func TestVariableCellRoundTrip(t *testing.T) {
 	}
 }
 
+// TestReadCellRejectsOversizedVariable locks in the DoS guard: a variable cell
+// whose length field exceeds MaxVariableBody is rejected without allocating it,
+// while a body at exactly the cap is accepted.
+func TestReadCellRejectsOversizedVariable(t *testing.T) {
+	t.Parallel()
+
+	// Header: CircID(4) | Command(VPADDING, variable) | Length(2).
+	hdr := func(n uint16) []byte {
+		b := []byte{0, 0, 0, 1, byte(CmdVPadding), byte(n >> 8), byte(n)}
+		return b
+	}
+
+	// Oversized: length field one past the cap. ReadCell must error before it
+	// tries to read (or allocate) the body.
+	over := hdr(uint16(MaxVariableBody + 1))
+	if _, err := ReadCell(bytes.NewReader(over), CircIDLenWide); err == nil {
+		t.Fatal("ReadCell accepted an oversized variable cell; want error")
+	}
+
+	// At the cap: a full body of MaxVariableBody bytes is accepted.
+	body := bytes.Repeat([]byte{0xcd}, MaxVariableBody)
+	atCap := append(hdr(uint16(MaxVariableBody)), body...)
+	got, err := ReadCell(bytes.NewReader(atCap), CircIDLenWide)
+	if err != nil {
+		t.Fatalf("ReadCell rejected a cell at the cap: %v", err)
+	}
+	if len(got.Payload) != MaxVariableBody {
+		t.Fatalf("body length = %d, want %d", len(got.Payload), MaxVariableBody)
+	}
+}
+
 func TestIsVariable(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

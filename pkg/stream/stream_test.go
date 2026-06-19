@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"net"
 	"sync"
 	"testing"
 	"time"
@@ -19,6 +20,7 @@ type mockCarrier struct {
 	sentRelay   []cell.RelayCell
 	sentData    [][]byte
 	autoConnect bool
+	blockData   bool // SendData blocks on ctx instead of returning immediately
 }
 
 func (m *mockCarrier) SetStreamHandler(fn func(cell.RelayCell)) { m.handler = fn }
@@ -33,7 +35,11 @@ func (m *mockCarrier) SendRelay(rc cell.RelayCell) error {
 	return nil
 }
 
-func (m *mockCarrier) SendData(_ context.Context, _ uint16, data []byte) error {
+func (m *mockCarrier) SendData(ctx context.Context, _ uint16, data []byte) error {
+	if m.blockData {
+		<-ctx.Done()
+		return ctx.Err()
+	}
 	m.mu.Lock()
 	m.sentData = append(m.sentData, append([]byte(nil), data...))
 	m.mu.Unlock()
@@ -87,6 +93,43 @@ func TestStreamConnectAndEcho(t *testing.T) {
 	}
 	if !bytes.Equal(buf, resp) {
 		t.Fatalf("read = %q, want %q", buf, resp)
+	}
+}
+
+// TestStreamWriteDeadlineReturnsTimeout covers two contract points: a write that
+// expires on its deadline must return a net.Error whose Timeout() is true (M1),
+// and the stream-level package token consumed for the failed chunk must be
+// credited back rather than leaked (M5).
+func TestStreamWriteDeadlineReturnsTimeout(t *testing.T) {
+	t.Parallel()
+	mc := &mockCarrier{autoConnect: true, blockData: true}
+	m := NewManager(mc, nil)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	s, err := m.Begin(ctx, "example.com:80")
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+
+	tokensBefore := len(s.pkgTokens)
+	if tokensBefore == 0 {
+		t.Fatal("expected a non-empty package window before write")
+	}
+
+	if err := s.SetWriteDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("SetWriteDeadline: %v", err)
+	}
+	_, err = s.Write([]byte("data"))
+	if err == nil {
+		t.Fatal("expected a write timeout error, got nil")
+	}
+	var ne net.Error
+	if !errors.As(err, &ne) || !ne.Timeout() {
+		t.Fatalf("write error = %v; want a net.Error with Timeout()==true", err)
+	}
+	if got := len(s.pkgTokens); got != tokensBefore {
+		t.Fatalf("package tokens = %d after failed write, want %d (token leaked)", got, tokensBefore)
 	}
 }
 

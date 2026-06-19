@@ -3,14 +3,63 @@ package socks
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/n0madic/go-tor-client/pkg/proxyauth"
 )
+
+// TestServeSlowLorisClosesIdleConn locks in the slow-loris defense: a client
+// that connects and then sends nothing must be disconnected by the server once
+// the handshake deadline fires, rather than pinning a goroutine forever.
+func TestServeSlowLorisClosesIdleConn(t *testing.T) {
+	t.Parallel()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	srv := &Server{Factory: factoryFor(echoDialer()), testHandshakeTimeout: 100 * time.Millisecond}
+	go func() { _ = srv.Serve(t.Context(), ln) }()
+
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+
+	// Send nothing. The server must close the connection after its handshake
+	// deadline; the client then observes EOF. A generous client-side deadline is
+	// only a safety net: if the server fails to close, Read returns a timeout
+	// (not EOF) and the test fails.
+	_ = conn.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := conn.Read(make([]byte, 1)); !errors.Is(err, io.EOF) {
+		t.Fatalf("idle connection not closed by server: read err = %v, want EOF", err)
+	}
+}
+
+// TestIsTemporaryAcceptErr verifies that transient Accept errors (fd exhaustion,
+// aborted connections) are classified as retryable while genuine failures are not.
+func TestIsTemporaryAcceptErr(t *testing.T) {
+	t.Parallel()
+	for _, e := range []error{syscall.EMFILE, syscall.ENFILE, syscall.ECONNABORTED, syscall.ECONNRESET, syscall.ENOBUFS, syscall.ENOMEM} {
+		if !isTemporaryAcceptErr(e) {
+			t.Errorf("isTemporaryAcceptErr(%v) = false, want true", e)
+		}
+		if !isTemporaryAcceptErr(fmt.Errorf("socks: accept: %w", e)) {
+			t.Errorf("isTemporaryAcceptErr(wrapped %v) = false, want true", e)
+		}
+	}
+	for _, e := range []error{io.EOF, net.ErrClosed, errors.New("boom")} {
+		if isTemporaryAcceptErr(e) {
+			t.Errorf("isTemporaryAcceptErr(%v) = true, want false", e)
+		}
+	}
+}
 
 // fakeDialer records the dialed address and the auth identity it was created
 // for, and returns a preconfigured upstream conn (or error) to the proxy.

@@ -273,6 +273,11 @@ func (c *Client) dialClearnet(ctx context.Context, addr string, port int) (net.C
 			streams: 1,
 		}
 		c.poolMu.Lock()
+		// Retire (don't retain for reuse) once the pool is at capacity; the circuit
+		// still serves this dial and is torn down when its stream closes.
+		if c.retireNewClearnetLocked() {
+			pc.retired = true
+		}
 		c.clearnetPool = append(c.clearnetPool, pc)
 		c.built++
 		c.poolMu.Unlock()
@@ -524,14 +529,41 @@ func (c *Client) selectedGuard(ctx context.Context, guardRS *directory.RouterSta
 	return selectedRelay{rs: guardRS, md: md}, nil
 }
 
+// selectedRelayDirect bundles rs with its microdescriptor fetched over direct
+// HTTP (no tunnel), for family checks when building the directory circuit.
+func (c *Client) selectedRelayDirect(ctx context.Context, rs *directory.RouterStatus) (selectedRelay, error) {
+	if rs == nil {
+		return selectedRelay{}, fmt.Errorf("tor: guard not in consensus")
+	}
+	md, err := c.microdescDirect(ctx, rs)
+	if err != nil {
+		return selectedRelay{}, err
+	}
+	return selectedRelay{rs: rs, md: md}, nil
+}
+
 // pickRelay samples relays via sel until one fetches a microdescriptor that
 // passes mdOK (if non-nil) and shares no declared family with any already-chosen
-// relay, re-rolling on a conflict.
+// relay, re-rolling on a conflict. Microdescriptors are fetched through the
+// directory tunnel.
 func (c *Client) pickRelay(
 	ctx context.Context,
 	sel func(exclude ...*directory.RouterStatus) (*directory.RouterStatus, error),
 	chosen []selectedRelay,
 	mdOK func(directory.Microdescriptor) bool,
+) (selectedRelay, error) {
+	return c.pickRelayVia(ctx, sel, chosen, mdOK, c.microdesc)
+}
+
+// pickRelayVia is pickRelay with a pluggable microdescriptor fetcher, so the
+// directory circuit (which is the tunnel's own foundation) can resolve its relays
+// over direct HTTP instead of through the not-yet-built tunnel.
+func (c *Client) pickRelayVia(
+	ctx context.Context,
+	sel func(exclude ...*directory.RouterStatus) (*directory.RouterStatus, error),
+	chosen []selectedRelay,
+	mdOK func(directory.Microdescriptor) bool,
+	mdFetch func(context.Context, *directory.RouterStatus) (directory.Microdescriptor, error),
 ) (selectedRelay, error) {
 	exclude := make([]*directory.RouterStatus, 0, len(chosen)+8)
 	for _, ch := range chosen {
@@ -544,7 +576,7 @@ func (c *Client) pickRelay(
 		if err != nil {
 			return selectedRelay{}, err
 		}
-		md, err := c.microdesc(ctx, rs)
+		md, err := mdFetch(ctx, rs)
 		if err != nil {
 			lastErr = err
 			exclude = append(exclude, rs)

@@ -60,8 +60,13 @@ func ParseAuthCert(raw []byte) (*authCert, error) {
 	skSum := sha1.Sum(skDER)
 	cert.signingKeyFP = strings.ToUpper(hex.EncodeToString(skSum[:]))
 
-	if exp := fieldValue(raw, "dir-key-expires"); exp != "" {
-		cert.expires, _ = time.Parse("2006-01-02 15:04:05", exp)
+	exp := fieldValue(raw, "dir-key-expires")
+	if exp == "" {
+		return nil, errors.New("directory: cert missing dir-key-expires")
+	}
+	cert.expires, err = time.Parse("2006-01-02 15:04:05", exp)
+	if err != nil {
+		return nil, fmt.Errorf("directory: parse dir-key-expires %q: %w", exp, err)
 	}
 
 	// The dir-key-certification covers everything up to and including the
@@ -87,7 +92,9 @@ func (c *authCert) Verify(expectedV3Ident string, now time.Time) error {
 	if c.identityFP != strings.ToUpper(expectedV3Ident) {
 		return fmt.Errorf("directory: cert identity %s != authority %s", c.identityFP, expectedV3Ident)
 	}
-	if !c.expires.IsZero() && now.After(c.expires) {
+	// A missing/zero expiry is treated as invalid rather than never-expiring, so a
+	// cert without a usable dir-key-expires can never bypass the temporal bound.
+	if c.expires.IsZero() || now.After(c.expires) {
 		return errCertExpired
 	}
 	recovered, err := rsaRecover(c.identityKey, c.certSig)

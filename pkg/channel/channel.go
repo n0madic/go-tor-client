@@ -36,6 +36,16 @@ const (
 	// send window) cannot block a writer — and, since writes happen under the
 	// circuit lock, the inbound demux path — indefinitely.
 	cellWriteTimeout = 30 * time.Second
+
+	// handshakeTimeout bounds the whole link handshake so an unresponsive or
+	// malicious relay cannot hang Dial forever when the caller's context carries
+	// no deadline (e.g. context.Background()).
+	handshakeTimeout = 30 * time.Second
+
+	// maxHandshakeCells caps how many cells the handshake loop will read before
+	// NETINFO. A peer that floods PADDING/VPADDING (or any non-terminal cell)
+	// without ever sending NETINFO is rejected instead of looping forever.
+	maxHandshakeCells = 64
 )
 
 // circEntry is a circuit's inbound cell queue plus a done channel that is closed
@@ -75,6 +85,8 @@ type Config struct {
 	Logger *slog.Logger
 	// now overrides the clock for certificate validation in tests.
 	now func() time.Time
+	// handshakeTimeout overrides the default handshake deadline in tests.
+	handshakeTimeout time.Duration
 }
 
 // Dial connects to a relay at addr ("ip:port"), performs the TLS and link
@@ -108,9 +120,19 @@ func Dial(ctx context.Context, addr string, cfg Config) (*Channel, error) {
 		done:     make(chan struct{}),
 	}
 
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = tlsConn.SetDeadline(deadline)
+	// Always bound the handshake with a hard deadline, tightening it if the
+	// caller's context has an earlier one. Without this, a relay that completes
+	// the TCP/TLS dial but stalls the link handshake would hang Dial forever for
+	// a deadline-less context.
+	hsTimeout := handshakeTimeout
+	if cfg.handshakeTimeout > 0 {
+		hsTimeout = cfg.handshakeTimeout
 	}
+	hsDeadline := nowFn().Add(hsTimeout)
+	if d, ok := ctx.Deadline(); ok && d.Before(hsDeadline) {
+		hsDeadline = d
+	}
+	_ = tlsConn.SetDeadline(hsDeadline)
 	if err := ch.handshake(addr, cfg.ExpectedEd25519, nowFn()); err != nil {
 		tlsConn.Close()
 		return nil, err
@@ -150,7 +172,10 @@ func (ch *Channel) handshake(addr string, expectedEd []byte, now time.Time) erro
 	// 3. Read CERTS, AUTH_CHALLENGE, NETINFO (4-byte circuit IDs now).
 	var certsPayload []byte
 	var gotNetinfo bool
-	for !gotNetinfo {
+	for cells := 0; !gotNetinfo; cells++ {
+		if cells >= maxHandshakeCells {
+			return fmt.Errorf("channel: handshake exceeded %d cells without NETINFO", maxHandshakeCells)
+		}
 		c, err := cell.ReadCell(ch.br, cell.CircIDLenWide)
 		if err != nil {
 			return fmt.Errorf("channel: read handshake cell: %w", err)

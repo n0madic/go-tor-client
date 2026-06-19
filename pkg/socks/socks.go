@@ -21,6 +21,8 @@ import (
 	"log/slog"
 	"net"
 	"strconv"
+	"syscall"
+	"time"
 
 	"github.com/n0madic/go-tor-client/internal/relay"
 	"github.com/n0madic/go-tor-client/pkg/proxyauth"
@@ -56,6 +58,37 @@ const (
 	authStatusSuccess = 0x00
 )
 
+const (
+	// handshakeTimeout bounds the SOCKS negotiation+request read phase so a
+	// client that connects and then stalls (slow-loris) cannot pin a goroutine
+	// and file descriptor indefinitely. It is cleared before the long-lived
+	// bidirectional relay.
+	handshakeTimeout = 30 * time.Second
+
+	// maxConcurrentConns caps simultaneous in-flight connections. Accept blocks
+	// once the cap is reached, providing backpressure against goroutine/fd
+	// exhaustion from a connection flood.
+	maxConcurrentConns = 1024
+
+	// maxAcceptBackoff caps the exponential backoff applied after a temporary
+	// Accept error (e.g. transient fd exhaustion) so the listener recovers
+	// instead of either spinning hot or dying.
+	maxAcceptBackoff = time.Second
+)
+
+// isTemporaryAcceptErr reports whether an Accept error is transient and the
+// server should back off and retry rather than terminate. Notably this covers
+// fd exhaustion (EMFILE/ENFILE) and aborted/reset connections, which a flood
+// can trigger but which clear once load subsides.
+func isTemporaryAcceptErr(err error) bool {
+	return errors.Is(err, syscall.ECONNABORTED) ||
+		errors.Is(err, syscall.ECONNRESET) ||
+		errors.Is(err, syscall.EMFILE) ||
+		errors.Is(err, syscall.ENFILE) ||
+		errors.Is(err, syscall.ENOBUFS) ||
+		errors.Is(err, syscall.ENOMEM)
+}
+
 // errUnsupportedAddrType is returned when a request carries an address type the
 // server cannot parse; the handler replies with replyAddrTypeNotSupported.
 var errUnsupportedAddrType = errors.New("socks: unsupported address type")
@@ -66,6 +99,24 @@ var errUnsupportedAddrType = errors.New("socks: unsupported address type")
 type Server struct {
 	Factory proxyauth.DialerFactory
 	Logger  *slog.Logger
+
+	// Test hooks (zero = use the package defaults).
+	testHandshakeTimeout time.Duration
+	testMaxConns         int
+}
+
+func (s *Server) hsTimeout() time.Duration {
+	if s.testHandshakeTimeout > 0 {
+		return s.testHandshakeTimeout
+	}
+	return handshakeTimeout
+}
+
+func (s *Server) maxConns() int {
+	if s.testMaxConns > 0 {
+		return s.testMaxConns
+	}
+	return maxConcurrentConns
 }
 
 func (s *Server) logger() *slog.Logger {
@@ -94,6 +145,8 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 		}
 	}()
 
+	sem := make(chan struct{}, s.maxConns())
+	var backoff time.Duration
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -101,10 +154,34 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 			case <-ctx.Done():
 				return nil
 			default:
-				return fmt.Errorf("socks: accept: %w", err)
 			}
+			if isTemporaryAcceptErr(err) {
+				if backoff == 0 {
+					backoff = 5 * time.Millisecond
+				} else if backoff *= 2; backoff > maxAcceptBackoff {
+					backoff = maxAcceptBackoff
+				}
+				logger.Debug("socks: temporary accept error, backing off", "err", err, "backoff", backoff)
+				select {
+				case <-time.After(backoff):
+				case <-ctx.Done():
+					return nil
+				}
+				continue
+			}
+			return fmt.Errorf("socks: accept: %w", err)
+		}
+		backoff = 0
+
+		// Acquire a slot (backpressure); release it when the connection finishes.
+		select {
+		case sem <- struct{}{}:
+		case <-ctx.Done():
+			_ = conn.Close()
+			return nil
 		}
 		go func() {
+			defer func() { <-sem }()
 			defer conn.Close()
 			if err := s.handle(ctx, conn); err != nil {
 				logger.Debug("socks: connection failed", "remote", conn.RemoteAddr(), "err", err)
@@ -117,6 +194,11 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 // optional user/pass auth, the CONNECT request, the upstream dial, and the
 // bidirectional relay.
 func (s *Server) handle(ctx context.Context, conn net.Conn) error {
+	// Bound the client-driven read phase so a stalled peer cannot hold the
+	// goroutine/fd forever. The dial below is bounded by ctx, and the long-lived
+	// relay runs without this deadline.
+	_ = conn.SetReadDeadline(time.Now().Add(s.hsTimeout()))
+
 	user, pass, err := negotiate(conn)
 	if err != nil {
 		return err
@@ -129,6 +211,8 @@ func (s *Server) handle(ctx context.Context, conn net.Conn) error {
 		}
 		return err
 	}
+	// Handshake reads done; clear the deadline before the dial and relay.
+	_ = conn.SetReadDeadline(time.Time{})
 	if cmd != cmdConnect {
 		_ = sendReply(conn, replyCommandNotSupported)
 		return fmt.Errorf("socks: unsupported command 0x%02x", cmd)

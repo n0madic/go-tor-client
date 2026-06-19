@@ -419,3 +419,56 @@ func TestParseBasicAuth(t *testing.T) {
 		})
 	}
 }
+
+// TestLimitListenerCapsConcurrentConns verifies the connection-limiting listener
+// blocks Accept once its slot budget is exhausted and resumes when a connection
+// closes — the backpressure that bounds goroutine/fd growth under a flood.
+func TestLimitListenerCapsConcurrentConns(t *testing.T) {
+	t.Parallel()
+	base, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	ll := &limitListener{Listener: base, sem: make(chan struct{}, 1)}
+	defer ll.Close()
+
+	c1, err := net.Dial("tcp", base.Addr().String())
+	if err != nil {
+		t.Fatalf("dial 1: %v", err)
+	}
+	defer c1.Close()
+	c2, err := net.Dial("tcp", base.Addr().String())
+	if err != nil {
+		t.Fatalf("dial 2: %v", err)
+	}
+	defer c2.Close()
+
+	a1, err := ll.Accept() // consumes the only slot
+	if err != nil {
+		t.Fatalf("accept 1: %v", err)
+	}
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		a, err := ll.Accept()
+		if err == nil {
+			accepted <- a
+		}
+	}()
+
+	// With the cap at 1 and a1 still open, the second Accept must block.
+	select {
+	case <-accepted:
+		t.Fatal("second Accept returned while the connection cap was full")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	// Closing the first accepted conn frees its slot; the second Accept proceeds.
+	_ = a1.Close()
+	select {
+	case a := <-accepted:
+		_ = a.Close()
+	case <-time.After(2 * time.Second):
+		t.Fatal("second Accept did not proceed after a slot was freed")
+	}
+}

@@ -389,12 +389,17 @@ func decompress(encoding string, body []byte) ([]byte, error) {
 // readAllLimited reads up to maxDecompressedSize bytes, returning an error if
 // the stream is larger — defending against decompression bombs.
 func readAllLimited(r io.Reader) ([]byte, error) {
-	data, err := io.ReadAll(io.LimitReader(r, maxDecompressedSize+1))
+	return readLimited(r, maxDecompressedSize)
+}
+
+// readLimited reads up to limit bytes, erroring if the stream exceeds it.
+func readLimited(r io.Reader, limit int64) ([]byte, error) {
+	data, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
 		return nil, err
 	}
-	if len(data) > maxDecompressedSize {
-		return nil, fmt.Errorf("directory: decompressed body exceeds %d bytes", maxDecompressedSize)
+	if int64(len(data)) > limit {
+		return nil, fmt.Errorf("directory: decompressed body exceeds %d bytes", limit)
 	}
 	return data, nil
 }

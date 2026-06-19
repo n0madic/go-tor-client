@@ -2,11 +2,62 @@ package onion
 
 import (
 	"bytes"
+	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/binary"
 	"os"
 	"testing"
 	"time"
 )
+
+// buildTorCert assembles a Tor ed25519 certificate (cert-spec.txt) certifying
+// certifiedKey, signed by signerPriv, with the signer key carried in the
+// signed-with-ed25519-key extension.
+func buildTorCert(certType byte, certifiedKey []byte, signerPub ed25519.PublicKey, signerPriv ed25519.PrivateKey, exp uint32) []byte {
+	b := []byte{0x01, certType, byte(exp >> 24), byte(exp >> 16), byte(exp >> 8), byte(exp), 0x01}
+	b = append(b, certifiedKey...) // CERTIFIED_KEY (32)
+	b = append(b, 0x01)            // N_EXT
+	b = append(b, 0x00, 0x20, certExtSignerKey, 0x00)
+	b = append(b, signerPub...) // ext data: signer key (32)
+	return append(b, ed25519.Sign(signerPriv, b)...)
+}
+
+// TestVerifyTorCertAuthKey exercises verifyTorCert on intro-point auth-key
+// certs (type [09]): a valid cert yields its certified key, and wrong signer,
+// wrong type, expiry, and a tampered signature are all rejected.
+func TestVerifyTorCertAuthKey(t *testing.T) {
+	t.Parallel()
+	signPub, signPriv, _ := ed25519.GenerateKey(rand.Reader)
+	authPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	now := time.Now()
+	exp := uint32(now.Add(24*time.Hour).Unix() / 3600)
+
+	cert := buildTorCert(introAuthCertID, authPub, signPub, signPriv, exp)
+	got, err := verifyTorCert(cert, signPub, introAuthCertID, now)
+	if err != nil {
+		t.Fatalf("verifyTorCert on a valid auth cert: %v", err)
+	}
+	if !bytes.Equal(got, authPub) {
+		t.Fatalf("certified key = %x, want %x", got, authPub)
+	}
+
+	otherPub, _, _ := ed25519.GenerateKey(rand.Reader)
+	if _, err := verifyTorCert(cert, otherPub, introAuthCertID, now); err == nil {
+		t.Error("accepted a cert with the wrong expected signer")
+	}
+	if _, err := verifyTorCert(cert, signPub, descCertType, now); err == nil {
+		t.Error("accepted a cert with the wrong cert type")
+	}
+	expired := buildTorCert(introAuthCertID, authPub, signPub, signPriv, uint32(now.Add(-time.Hour).Unix()/3600))
+	if _, err := verifyTorCert(expired, signPub, introAuthCertID, now); err == nil {
+		t.Error("accepted an expired cert")
+	}
+	tampered := append([]byte(nil), cert...)
+	tampered[len(tampered)-1] ^= 0xff
+	if _, err := verifyTorCert(tampered, signPub, introAuthCertID, now); err == nil {
+		t.Error("accepted a cert with a tampered signature")
+	}
+}
 
 // TestDescriptorSignatureFixture verifies the descriptor signature path against
 // a real captured v3 descriptor (the Tor Project onion) and its blinded key.

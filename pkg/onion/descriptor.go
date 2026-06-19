@@ -52,8 +52,11 @@ type Descriptor struct {
 // now is the reference time used to reject an expired descriptor-signing cert.
 func DecodeDescriptor(raw []byte, blindedKey, subcred, clientAuthKey []byte, now time.Time) (*Descriptor, error) {
 	// Authenticate the descriptor against the period's blinded key before
-	// trusting any of its contents (defends against a malicious HSDir).
-	if err := VerifyDescriptorSignature(raw, blindedKey, now); err != nil {
+	// trusting any of its contents (defends against a malicious HSDir). The
+	// certified signing key is reused below to verify each intro point's
+	// auth-key certificate.
+	signingKey, err := verifyDescriptorSignature(raw, blindedKey, now)
+	if err != nil {
 		return nil, err
 	}
 	revCounter, superBlob, err := parseOuter(raw)
@@ -85,7 +88,7 @@ func DecodeDescriptor(raw []byte, blindedKey, subcred, clientAuthKey []byte, now
 		return nil, fmt.Errorf("onion: second layer: %w", err)
 	}
 
-	intros, err := parseIntroPoints(inner)
+	intros, err := parseIntroPoints(inner, signingKey, now)
 	if err != nil {
 		return nil, err
 	}
@@ -190,8 +193,9 @@ func decryptLayer(blob, secretData, subcred []byte, revCounter uint64, stringCon
 	return out, nil
 }
 
-// parseIntroPoints parses the inner (second-layer) plaintext.
-func parseIntroPoints(inner []byte) ([]IntroPoint, error) {
+// parseIntroPoints parses the inner (second-layer) plaintext. signingKey is the
+// descriptor signing key, used to verify each intro point's auth-key cert.
+func parseIntroPoints(inner []byte, signingKey []byte, now time.Time) ([]IntroPoint, error) {
 	lines := splitLines(inner)
 	var intros []IntroPoint
 	var cur *IntroPoint
@@ -223,12 +227,14 @@ func parseIntroPoints(inner []byte) ([]IntroPoint, error) {
 			if cur != nil {
 				cert, next := readCertBlock(lines, i+1)
 				if cert != nil {
-					// TODO: also verify this cert's own signature against the
-					// descriptor signing key. The intro point's integrity is
-					// already covered transitively (this whole inner layer is
-					// decrypted from the descriptor authenticated in
-					// VerifyDescriptorSignature), so we only extract the key here.
-					cur.AuthKey = certifiedKey(cert)
+					// Verify the auth-key cert (type [09]) is signed by the
+					// descriptor signing key and take its certified key. On failure
+					// AuthKey stays nil and the validity filter below drops this
+					// intro point. (The inner layer is already authenticated via the
+					// descriptor signature, so this is belt-and-suspenders.)
+					if key, err := verifyTorCert(cert, signingKey, introAuthCertID, now); err == nil {
+						cur.AuthKey = key
+					}
 				}
 				i = next - 1 // resume after the block (loop's i++ steps to next)
 			}
@@ -294,16 +300,6 @@ func readCertBlock(lines []string, start int) ([]byte, int) {
 		}
 	}
 	return nil, len(lines)
-}
-
-// certifiedKey returns the 32-byte certified key from a Tor ed25519 cert:
-// VER(1)|TYPE(1)|EXP(4)|KEYTYPE(1)|CERTIFIED_KEY(32)|...
-func certifiedKey(cert []byte) []byte {
-	const off = 1 + 1 + 4 + 1
-	if len(cert) < off+32 {
-		return nil
-	}
-	return append([]byte(nil), cert[off:off+32]...)
 }
 
 // LinkSpecAddr decodes a link-specifier list into a connectable RelayInfo-like

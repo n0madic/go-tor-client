@@ -47,6 +47,7 @@ func runHTTP(ctx context.Context, args []string) error {
 	}
 	defer ln.Close()
 	logger.Info("HTTP proxy listening", "addr", ln.Addr())
+	warnIfPublicListener(logger, ln.Addr())
 
 	srv := &httpproxy.Server{Factory: pool.dialer, Logger: logger}
 	return srv.Serve(ctx, ln)

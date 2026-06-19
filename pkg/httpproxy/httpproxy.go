@@ -36,6 +36,50 @@ import (
 	"github.com/n0madic/go-tor-client/pkg/proxyauth"
 )
 
+const (
+	// readHeaderTimeout bounds how long a client may take to send its request
+	// headers; the slow-loris defense for the HTTP proxy.
+	readHeaderTimeout = 30 * time.Second
+	// idleTimeout bounds how long an idle keep-alive connection is kept open.
+	idleTimeout = 60 * time.Second
+	// maxHeaderBytes caps request header size (matches net/http's default).
+	maxHeaderBytes = 1 << 20
+	// maxConcurrentConns caps simultaneous accepted connections to prevent
+	// goroutine/fd exhaustion from a connection flood.
+	maxConcurrentConns = 1024
+)
+
+// limitListener bounds the number of simultaneously accepted connections. Accept
+// blocks once the limit is reached and resumes as connections close, providing
+// backpressure without a third-party dependency.
+type limitListener struct {
+	net.Listener
+	sem chan struct{}
+}
+
+func (l *limitListener) Accept() (net.Conn, error) {
+	l.sem <- struct{}{}
+	conn, err := l.Listener.Accept()
+	if err != nil {
+		<-l.sem
+		return nil, err
+	}
+	return &limitConn{Conn: conn, release: func() { <-l.sem }}, nil
+}
+
+// limitConn releases its listener slot exactly once when closed.
+type limitConn struct {
+	net.Conn
+	once    sync.Once
+	release func()
+}
+
+func (c *limitConn) Close() error {
+	err := c.Conn.Close()
+	c.once.Do(c.release)
+	return err
+}
+
 // Server is an HTTP forward proxy. Factory is required and returns the upstream
 // dialer for each connection's Proxy-Authorization identity (see
 // proxyauth.DialerFactory); Logger is optional and defaults to a discard logger.
@@ -103,7 +147,16 @@ func (s *Server) Serve(ctx context.Context, ln net.Listener) error {
 	srv := &http.Server{
 		Handler:     s,
 		BaseContext: func(net.Listener) context.Context { return ctx },
+		// ReadHeaderTimeout is the slow-loris defense: it bounds how long a client
+		// may take to send request headers. ReadTimeout/WriteTimeout are
+		// deliberately NOT set — they would impose an absolute deadline that breaks
+		// long-lived CONNECT tunnels and large forwarded responses.
+		ReadHeaderTimeout: readHeaderTimeout,
+		IdleTimeout:       idleTimeout,
+		MaxHeaderBytes:    maxHeaderBytes,
 	}
+	// Bound concurrent connections to prevent goroutine/fd exhaustion from a flood.
+	ln = &limitListener{Listener: ln, sem: make(chan struct{}, maxConcurrentConns)}
 	errCh := make(chan error, 1)
 	go func() { errCh <- srv.Serve(ln) }()
 
@@ -170,6 +223,9 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request, user, pas
 		return
 	}
 	defer clientConn.Close()
+	// Clear any read deadline inherited from the header-read phase so the
+	// long-lived tunnel is not torn down by a stale deadline.
+	_ = clientConn.SetDeadline(time.Time{})
 
 	if _, err := io.WriteString(clientConn, "HTTP/1.1 200 Connection Established\r\n\r\n"); err != nil {
 		return

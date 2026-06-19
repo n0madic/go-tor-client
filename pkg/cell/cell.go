@@ -17,6 +17,12 @@ import (
 // PayloadLen is the fixed payload size of a link cell (link v4+).
 const PayloadLen = 509
 
+// MaxVariableBody caps the body of a variable-length cell. The largest cell a
+// client legitimately reads is CERTS (a few KiB); 16 KiB leaves generous
+// headroom while preventing a peer from forcing a 64 KiB allocation per cell
+// (e.g. a flood of max-length VPADDING) as an allocation-churn DoS.
+const MaxVariableBody = 16 * 1024
+
 // CircIDLenShort and CircIDLenWide are the two circuit-ID widths. The short
 // width is used only for the initial VERSIONS cell.
 const (
@@ -153,6 +159,9 @@ func ReadCell(r io.Reader, circIDLen int) (Cell, error) {
 			return Cell{}, err
 		}
 		n := binary.BigEndian.Uint16(lenBuf[:])
+		if int(n) > MaxVariableBody {
+			return Cell{}, fmt.Errorf("cell: variable body %d exceeds max %d", n, MaxVariableBody)
+		}
 		body := make([]byte, n)
 		if _, err := io.ReadFull(r, body); err != nil {
 			return Cell{}, err

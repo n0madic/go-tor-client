@@ -1,6 +1,7 @@
 package torcrypto
 
 import (
+	"crypto/subtle"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -109,7 +110,7 @@ func (c *HSNtorClient) Finish(serverY, authRecv []byte) (ntorKeySeed []byte, err
 	verify := hsMac(rendSecret, hsTVerify)
 	authInput := concat(verify, c.authKey, c.encKey, serverY, c.clientX, hsProtoB, hsServerL)
 	authExpected := hsMac(authInput, hsTMac)
-	if !constantTimeEqual(authExpected, authRecv) {
+	if subtle.ConstantTimeCompare(authExpected, authRecv) != 1 {
 		return nil, ErrHSNtorAuth
 	}
 	return seed, nil
@@ -121,15 +122,4 @@ func (c *HSNtorClient) Finish(serverY, authRecv []byte) (ntorKeySeed []byte, err
 func HSNtorExpandKeys(ntorKeySeed []byte) (df, db, kf, kb []byte) {
 	k := SHAKE256(hsE2EKeyMaterialLen, ntorKeySeed, hsMExpand)
 	return k[0:32], k[32:64], k[64:96], k[96:128]
-}
-
-func constantTimeEqual(a, b []byte) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	var v byte
-	for i := range a {
-		v |= a[i] ^ b[i]
-	}
-	return v == 0
 }

@@ -52,6 +52,40 @@ func TestDiskCacheRoundTrip(t *testing.T) {
 	}
 }
 
+// TestDiskCacheNoPathTraversal verifies a crafted key cannot escape the cache
+// root: the write must either be neutralized into the root or refused, and no
+// file may appear outside the cache directory.
+func TestDiskCacheNoPathTraversal(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dir := filepath.Join(root, "cache")
+	dc, err := NewDiskCache(dir)
+	if err != nil {
+		t.Fatalf("NewDiskCache: %v", err)
+	}
+
+	sentinel := []byte("escaped")
+	for _, key := range []string{
+		"../escape",
+		"md/../../escape",
+		"../../escape",
+		"md/..%2f..%2fescape",
+	} {
+		dc.Put(key, sentinel)
+	}
+
+	// Nothing may be written outside the cache dir (siblings of it under root).
+	entries, _ := os.ReadDir(root)
+	for _, e := range entries {
+		if e.Name() != "cache" {
+			t.Errorf("path traversal created %q outside the cache root", e.Name())
+		}
+	}
+	if _, err := os.Stat(filepath.Join(root, "escape")); err == nil {
+		t.Error("traversal wrote an 'escape' file in the parent directory")
+	}
+}
+
 // mapCache is an in-memory Cache for testing the client cache paths.
 type mapCache struct{ m map[string][]byte }
 

@@ -5,7 +5,6 @@ import (
 	"fmt"
 
 	"github.com/n0madic/go-tor-client/pkg/circuit"
-	"github.com/n0madic/go-tor-client/pkg/directory"
 	"github.com/n0madic/go-tor-client/pkg/stream"
 )
 
@@ -87,23 +86,24 @@ func (c *Client) buildDirCircuit(ctx context.Context) (*circuit.Circuit, error) 
 		return nil, fmt.Errorf("tor: client closed")
 	}
 
+	// Select middle and dir-cache with the same family exclusion the exit circuit
+	// uses, resolving microdescriptors over direct HTTP (the tunnel this circuit
+	// underpins does not exist yet).
+	guardSel, err := c.selectedRelayDirect(ctx, guardRS)
+	if err != nil {
+		return nil, err
+	}
 	sel := c.selector()
-	middle, err := sel.SelectMiddle(guardRS)
+	middle, err := c.pickRelayVia(ctx, sel.SelectMiddle, []selectedRelay{guardSel}, nil, c.microdescDirect)
 	if err != nil {
 		return nil, err
 	}
-	dirRelay, err := sel.SelectDirCache(guardRS, middle)
+	dirRelay, err := c.pickRelayVia(ctx, sel.SelectDirCache, []selectedRelay{guardSel, middle}, nil, c.microdescDirect)
 	if err != nil {
 		return nil, err
 	}
-	middleInfo, err := c.relayInfoDirect(ctx, middle)
-	if err != nil {
-		return nil, err
-	}
-	dirInfo, err := c.relayInfoDirect(ctx, dirRelay)
-	if err != nil {
-		return nil, err
-	}
+	middleInfo := toRelayInfo(middle.rs, middle.md)
+	dirInfo := toRelayInfo(dirRelay.rs, dirRelay.md)
 
 	circ, err := circuit.New(guardChan, c.log)
 	if err != nil {
@@ -115,12 +115,4 @@ func (c *Client) buildDirCircuit(ctx context.Context) (*circuit.Circuit, error) 
 	}
 	c.log.Debug("directory circuit built", "middle", middleInfo.Nickname, "dircache", dirInfo.Nickname)
 	return circ, nil
-}
-
-func (c *Client) relayInfoDirect(ctx context.Context, rs *directory.RouterStatus) (circuit.RelayInfo, error) {
-	md, err := c.microdescDirect(ctx, rs)
-	if err != nil {
-		return circuit.RelayInfo{}, err
-	}
-	return toRelayInfo(rs, md), nil
 }

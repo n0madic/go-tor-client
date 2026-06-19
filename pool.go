@@ -22,6 +22,17 @@ const (
 	// reapInterval is how often the background janitor scans the pool for
 	// circuits to tear down.
 	reapInterval = 30 * time.Second
+
+	// maxClearnetCircuits caps the number of reusable clearnet circuits retained
+	// in the pool. A burst of concurrent dials may transiently build more (each
+	// serves its dial), but any circuit beyond the cap is retired on construction
+	// so it is torn down once its stream closes instead of being kept for reuse.
+	maxClearnetCircuits = 32
+	// maxOnionCircuitsPerHost caps reusable circuits retained per onion host.
+	maxOnionCircuitsPerHost = 8
+	// maxOnionHosts caps the number of distinct onion hosts retained in the pool,
+	// bounding memory when a client dials many different services.
+	maxOnionHosts = 64
 )
 
 // pooledCircuit is a reusable circuit plus its stream manager. A single manager
@@ -31,7 +42,7 @@ const (
 type pooledCircuit struct {
 	circ    *circuit.Circuit
 	mgr     *stream.Manager           // one manager per circuit → multi-stream multiplex
-	born    time.Time                 // dirty-since: set when the circuit is first used
+	born    time.Time                 // dirty-since clock: set when the circuit is built
 	onion   string                    // "" = clearnet; otherwise the onion host (reuse key)
 	exitMD  directory.Microdescriptor // clearnet only: for ExitPolicy.Allows(port)
 	streams int                       // active stream count (guarded by poolMu)
@@ -43,6 +54,45 @@ type pooledCircuit struct {
 // caller's requirement (exit allows the port, or onion host equal).
 func circuitReusable(born, now time.Time, maxDirty time.Duration, retired, closed, matches bool) bool {
 	return !closed && !retired && now.Sub(born) < maxDirty && matches
+}
+
+// reusableClearnetLocked counts clearnet circuits still eligible for reuse
+// (not retired). Must hold poolMu.
+func (c *Client) reusableClearnetLocked() int {
+	n := 0
+	for _, pc := range c.clearnetPool {
+		if !pc.retired {
+			n++
+		}
+	}
+	return n
+}
+
+// reusableOnionLocked counts reusable circuits retained for host. Must hold poolMu.
+func (c *Client) reusableOnionLocked(host string) int {
+	n := 0
+	for _, pc := range c.onionPool[host] {
+		if !pc.retired {
+			n++
+		}
+	}
+	return n
+}
+
+// retireNewClearnetLocked reports whether a freshly built clearnet circuit should
+// be retired (served once, not retained for reuse) because the pool is already at
+// capacity. Must hold poolMu.
+func (c *Client) retireNewClearnetLocked() bool {
+	return c.reusableClearnetLocked() >= maxClearnetCircuits
+}
+
+// retireNewOnionLocked reports whether a freshly built onion circuit for host
+// should be retired because the host — or the distinct-host count — is at
+// capacity. Must hold poolMu.
+func (c *Client) retireNewOnionLocked(host string) bool {
+	newHost := c.onionPool[host] == nil
+	return c.reusableOnionLocked(host) >= maxOnionCircuitsPerHost ||
+		(newHost && len(c.onionPool) >= maxOnionHosts)
 }
 
 // Stats reports circuit-pool counters for observability and tests.
@@ -117,6 +167,11 @@ func (c *Client) dialOnionViaDescriptor(ctx context.Context, host string, desc *
 		streams: 1,
 	}
 	c.poolMu.Lock()
+	// Retire (don't retain for reuse) once this host — or the host count — is at
+	// capacity; the circuit still serves this dial and is torn down on close.
+	if c.retireNewOnionLocked(host) {
+		pc.retired = true
+	}
 	c.onionPool[host] = append(c.onionPool[host], pc)
 	c.built++
 	c.poolMu.Unlock()

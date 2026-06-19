@@ -11,6 +11,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"os/signal"
 	"strings"
@@ -64,6 +65,24 @@ Subcommands:
 
 Run "go-tor-client <subcommand> -h" for per-subcommand flags.
 `)
+}
+
+// warnIfPublicListener logs a prominent warning when a proxy is bound to a
+// non-loopback address. The proxies perform NO client authentication (the
+// credentials are isolation tokens, not validated secrets), so a non-loopback
+// bind is an open proxy that anyone who can reach the address may use to route
+// traffic through the host's Tor circuits.
+func warnIfPublicListener(logger *slog.Logger, addr net.Addr) {
+	host, _, err := net.SplitHostPort(addr.String())
+	if err != nil {
+		return
+	}
+	if ip := net.ParseIP(host); ip == nil || ip.IsLoopback() {
+		return
+	}
+	logger.Warn("proxy bound to a non-loopback address with NO authentication: "+
+		"anyone who can reach this address can route traffic through your Tor circuits",
+		"addr", addr.String())
 }
 
 // buildLogger returns a stderr text logger at the named level (debug|info|warn|

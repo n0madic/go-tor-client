@@ -27,6 +27,10 @@ const (
 	ed25519PublicKeyLen     = 32
 	edCertInnerTypeSigning  = 4 // CERT_TYPE inside the signing cert
 	edCertInnerTypeLinkAuth = 5 // CERT_TYPE inside the TLS-link cert
+
+	// edCertKeyTypeEd25519 is the certified-key type for an Ed25519 key
+	// (cert-spec.txt); the signing cert must certify one.
+	edCertKeyTypeEd25519 = 0x01
 )
 
 var (
@@ -141,6 +145,9 @@ func verifyCerts(payload, tlsCertDER []byte, now time.Time) (identity []byte, er
 	if signingCert.certType != edCertInnerTypeSigning {
 		return nil, fmt.Errorf("%w: signing cert wrong inner type %d", errBadCert, signingCert.certType)
 	}
+	if signingCert.keyType != edCertKeyTypeEd25519 {
+		return nil, fmt.Errorf("%w: signing cert key type %d, want ed25519", errBadCert, signingCert.keyType)
+	}
 	identityKey, ok := signingCert.signerKey()
 	if !ok {
 		return nil, errors.New("channel: signing cert missing identity-key extension")
@@ -157,12 +164,17 @@ func verifyCerts(payload, tlsCertDER []byte, now time.Time) (identity []byte, er
 	if linkCert.certType != edCertInnerTypeLinkAuth {
 		return nil, fmt.Errorf("%w: link cert wrong inner type %d", errBadCert, linkCert.certType)
 	}
+	// Note: the type-5 link cert's certified key is a SHA-256 digest of the X.509
+	// TLS cert, not an Ed25519 key; its key type is validated implicitly by the
+	// digest binding below rather than by an explicit key-type check (relays vary
+	// in the key-type byte they stamp here, so an explicit check risks rejecting
+	// otherwise-valid relays).
 	if err := linkCert.verify(signingKey, now); err != nil {
 		return nil, fmt.Errorf("channel: link cert: %w", err)
 	}
 
 	wantDigest := sha256.Sum256(tlsCertDER)
-	if !bytes.Equal(linkCert.certifiedKey, wantDigest[:]) {
+	if len(linkCert.certifiedKey) != sha256.Size || !bytes.Equal(linkCert.certifiedKey, wantDigest[:]) {
 		return nil, errors.New("channel: link cert does not match TLS certificate (possible MITM)")
 	}
 
